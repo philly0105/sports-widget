@@ -17,11 +17,46 @@ const LEAGUES = [
 
 const BASE_URL = 'https://site.api.espn.com/apis/site/v2/sports';
 
+// ── Persisted UI settings ─────────────────────────────────
+// Remembers last league filter, date tab, always-on-top and compact mode
+// across launches.
+const UI_KEY = 'sports-widget-ui';
+function loadUI() {
+  try {
+    return JSON.parse(localStorage.getItem(UI_KEY) || '{}') || {};
+  } catch (_) {
+    return {};
+  }
+}
+function saveUI() {
+  localStorage.setItem(UI_KEY, JSON.stringify({
+    leagueFilter: state.leagueFilter,
+    dateOffset: state.dateOffset,
+    alwaysOnTop: state.alwaysOnTop,
+    compact: state.compact,
+  }));
+}
+const _ui = loadUI();
+
+// ── Native bridge (Tauri commands) ────────────────────────
+function nativeInvoke(cmd, args) {
+  if (!window.__TAURI__) return Promise.resolve(null);
+  return window.__TAURI__.core.invoke(cmd, args).catch(err => {
+    console.warn(`native ${cmd} failed:`, err);
+    return null;
+  });
+}
+function notifyNative(title, body) {
+  return nativeInvoke('notify', { title, body });
+}
+
 // ── State ─────────────────────────────────────────────────
 
 let state = {
-  dateOffset: 0,
-  leagueFilter: 'all',
+  dateOffset: typeof _ui.dateOffset === 'number' ? _ui.dateOffset : 0,
+  leagueFilter: _ui.leagueFilter || 'all',
+  alwaysOnTop: !!_ui.alwaysOnTop,
+  compact: !!_ui.compact,
   games: {},
   loading: true,
   error: null,
@@ -155,14 +190,41 @@ function parseEvent(ev, leagueCfg) {
   };
 }
 
-async function fetchAllLeagues() {
-  state.loading = true;
-  state.error = null;
-  render();
+// Which leagues had any games on the active date — used to skip out-of-season
+// leagues on background polls. Recomputed on every full sweep.
+const FULL_SWEEP_MS = 10 * 60 * 1000; // re-check every league at least this often
+
+function fetchAllLeagues({ background = false } = {}) {
+  // Background polls only ever run for the Today view (see scheduleAutoRefresh).
+  // For those, fetch only the leagues we've seen games in — unless it's time
+  // for a periodic full sweep to catch a league that just came into season.
+  const dueForSweep = !state._lastFullSweep || (Date.now() - state._lastFullSweep) > FULL_SWEEP_MS;
+  const isFullSweep = !background || state.dateOffset === 1 || dueForSweep || !state.leaguesWithGames;
+
+  let leaguesToFetch = LEAGUES;
+  if (!isFullSweep) {
+    const keep = new Set(state.leaguesWithGames || []);
+    if (state.leagueFilter !== 'all') keep.add(state.leagueFilter);
+    leaguesToFetch = LEAGUES.filter(l => keep.has(l.key));
+    if (leaguesToFetch.length === 0) leaguesToFetch = LEAGUES; // nothing known yet
+  }
+
+  return _runLeagueFetch(leaguesToFetch, isFullSweep, background);
+}
+
+async function _runLeagueFetch(leaguesToFetch, isFullSweep, background) {
+  // Show the spinner only for foreground fetches; background polls update silently.
+  if (!background) {
+    state.loading = true;
+    state.error = null;
+    render();
+  }
 
   try {
-    const games = {};
-    LEAGUES.forEach(l => { games[l.key] = []; });
+    // Preserve games for leagues we're not refetching this pass.
+    const games = { ...state.games };
+    LEAGUES.forEach(l => { if (!games[l.key]) games[l.key] = []; });
+    leaguesToFetch.forEach(l => { games[l.key] = []; });
 
     if (state.dateOffset === 1) {
       // Upcoming: fetch next 7 days
@@ -170,9 +232,9 @@ async function fetchAllLeagues() {
       for (let day = 1; day <= 7; day++) {
         const dateStr = getDateStr(day);
         dayFetches.push(
-          Promise.allSettled(LEAGUES.map(l => fetchLeague(l, dateStr)))
+          Promise.allSettled(leaguesToFetch.map(l => fetchLeague(l, dateStr)))
             .then(results => {
-              LEAGUES.forEach((l, i) => {
+              leaguesToFetch.forEach((l, i) => {
                 if (results[i].status === 'fulfilled') {
                   games[l.key].push(...results[i].value.filter(Boolean));
                 }
@@ -184,9 +246,9 @@ async function fetchAllLeagues() {
     } else {
       const dateStr = getDateStr(state.dateOffset);
       const results = await Promise.allSettled(
-        LEAGUES.map(l => fetchLeague(l, dateStr))
+        leaguesToFetch.map(l => fetchLeague(l, dateStr))
       );
-      LEAGUES.forEach((l, i) => {
+      leaguesToFetch.forEach((l, i) => {
         if (results[i].status === 'fulfilled') {
           games[l.key] = results[i].value.filter(Boolean);
         } else {
@@ -198,12 +260,137 @@ async function fetchAllLeagues() {
     state.games = games;
     state.loading = false;
     state.error = null;
+
+    // After a full sweep we know exactly which leagues are in season today.
+    if (isFullSweep) {
+      state._lastFullSweep = Date.now();
+      if (state.dateOffset === 0) {
+        state.leaguesWithGames = LEAGUES.filter(l => (games[l.key] || []).length > 0).map(l => l.key);
+      }
+    }
   } catch (err) {
     state.loading = false;
     state.error = err.message;
   }
 
   render();
+  onGamesUpdated();
+}
+
+// ══════════════════════════════════════════════════════════
+// NOTIFICATIONS + TRAY
+// ══════════════════════════════════════════════════════════
+
+// Per-session memory so we only notify on state transitions, never replay
+// past events on relaunch.
+const gameMemory = {};          // gameId -> { status, leader, closeAlerted }
+const notifiedProps = {};       // propId -> 'hit' | 'miss'
+let notificationsArmed = false; // first sweep records state without notifying
+let propsArmed = false;
+
+function gameInvolvesFavorite(g) {
+  return state.favorites.includes(g.away?.abbr) || state.favorites.includes(g.home?.abbr);
+}
+
+function gameLeader(g) {
+  const a = parseInt(g.away?.score, 10) || 0;
+  const h = parseInt(g.home?.score, 10) || 0;
+  if (a === h) return 'tie';
+  return a > h ? 'away' : 'home';
+}
+
+function gameMargin(g) {
+  const a = parseInt(g.away?.score, 10) || 0;
+  const h = parseInt(g.home?.score, 10) || 0;
+  return Math.abs(a - h);
+}
+
+// "Late" period for a close-game alert, per sport.
+function isLatePeriod(g) {
+  if (g.sport === 'baseball') return g.period >= 8;
+  if (g.sport === 'hockey') return g.period >= 3;
+  if (g.sport === 'soccer') return g.period >= 2;  // 2nd half
+  return g.period >= 4;                              // football / basketball
+}
+
+// Low-scoring sports get a tighter "close" threshold.
+function closeThreshold(g) {
+  return (g.sport === 'baseball' || g.sport === 'hockey' || g.sport === 'soccer') ? 1 : 8;
+}
+
+function onGamesUpdated() {
+  updateTrayTooltip();
+  evaluateGameNotifications();
+}
+
+function evaluateGameNotifications() {
+  for (const l of LEAGUES) {
+    for (const g of (state.games[l.key] || [])) {
+      const prev = gameMemory[g.id];
+      const leader = gameLeader(g);
+      const cur = { status: g.statusType, leader, closeAlerted: prev?.closeAlerted || false };
+
+      if (notificationsArmed && prev && gameInvolvesFavorite(g)) {
+        const matchup = `${g.away?.abbr} @ ${g.home?.abbr}`;
+        if (prev.status === 'STATUS_SCHEDULED' && g.statusType === 'STATUS_IN_PROGRESS') {
+          notifyNative('Game starting', matchup);
+        }
+        if (prev.status !== 'STATUS_FINAL' && g.statusType === 'STATUS_FINAL') {
+          notifyNative('Final', `${g.away?.abbr} ${g.away?.score} — ${g.home?.score} ${g.home?.abbr}`);
+        }
+        // Lead change: a genuine flip between the two teams (not the first score).
+        if (g.statusType === 'STATUS_IN_PROGRESS' &&
+            prev.leader && prev.leader !== 'tie' &&
+            leader !== 'tie' && leader !== prev.leader) {
+          const leadAbbr = leader === 'away' ? g.away?.abbr : g.home?.abbr;
+          notifyNative('Lead change', `${leadAbbr} lead · ${g.away?.abbr} ${g.away?.score}-${g.home?.score} ${g.home?.abbr}`);
+        }
+        if (g.statusType === 'STATUS_IN_PROGRESS' && !cur.closeAlerted &&
+            isLatePeriod(g) && gameMargin(g) <= closeThreshold(g)) {
+          cur.closeAlerted = true;
+          notifyNative('Close game', `${g.away?.abbr} ${g.away?.score}-${g.home?.score} ${g.home?.abbr} · ${g.statusDetail}`);
+        }
+      }
+
+      gameMemory[g.id] = cur;
+    }
+  }
+  notificationsArmed = true;
+}
+
+function evaluatePropNotifications() {
+  for (const prop of state.trackedProps) {
+    const r = evalProp(prop);
+    if (r.hit !== true && r.hit !== false) continue; // undecided
+    const outcome = r.hit ? 'hit' : 'miss';
+    if (notifiedProps[prop.id] === outcome) continue;
+    notifiedProps[prop.id] = outcome;
+    if (!propsArmed) continue; // record state on first pass, don't notify
+    const dir = prop.direction === 'over' ? 'Over' : 'Under';
+    const verb = r.hit ? 'HIT ✅' : 'MISS ❌';
+    const val = r.current === null ? '—' : (Number.isInteger(r.current) ? r.current : r.current.toFixed(1));
+    notifyNative(`Prop ${verb}`, `${prop.athleteName} ${dir} ${prop.line} ${prop.statName} (now ${val})`);
+  }
+  propsArmed = true;
+}
+
+function updateTrayTooltip() {
+  if (!window.__TAURI__) return;
+  const live = [];
+  for (const l of LEAGUES) {
+    for (const g of (state.games[l.key] || [])) {
+      if (g.statusType === 'STATUS_IN_PROGRESS') {
+        live.push(`${g.away?.abbr} ${g.away?.score}-${g.home?.score} ${g.home?.abbr}`);
+      }
+    }
+  }
+  let tip = 'Sports Widget';
+  if (live.length > 0) {
+    tip = `${live.length} live · ` + live.slice(0, 4).join('  •  ');
+    if (live.length > 4) tip += `  +${live.length - 4} more`;
+  }
+  if (tip.length > 120) tip = tip.slice(0, 117) + '…'; // Windows tray tooltip limit
+  nativeInvoke('set_tray_tooltip', { text: tip });
 }
 
 // ── Game Detail Fetch ─────────────────────────────────────
@@ -382,6 +569,7 @@ function renderStandingsTable(title, entries, leagueKey) {
 
 function renderStandings() {
   const container = document.getElementById('games-container');
+  const _savedScroll = container ? container.scrollTop : 0;
 
   if (state.loading) {
     container.innerHTML = `
@@ -451,17 +639,28 @@ function renderStandings() {
       </div>`;
   } else {
     container.innerHTML = html;
+    if (container) container.scrollTop = _savedScroll;
   }
 }
 
 // ── Rendering (Main List) ─────────────────────────────────
 
 
+function scrollToTop() {
+  const el = document.getElementById('games-container');
+  if (el) el.scrollTop = 0;
+}
+
 function render() {
   if (state.showStandings) {
     renderStandings();
     return;
   }
+
+  // Preserve scroll across background re-renders (auto-refresh / prop polls).
+  // Navigation actions call scrollToTop() explicitly to reset.
+  const _scrollEl = document.getElementById('games-container');
+  const _savedScroll = _scrollEl ? _scrollEl.scrollTop : 0;
 
   // Update active filter banner
   const filterBanner = document.getElementById('filter-banner');
@@ -631,6 +830,7 @@ function render() {
   html += `<div class="last-updated">Updated ${now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</div>`;
 
   container.innerHTML = html;
+  if (_scrollEl) _scrollEl.scrollTop = _savedScroll;
 }
 
 function renderGameCard(game) {
@@ -1477,6 +1677,7 @@ function renderGameInfo(game, detail) {
 
 function clearTeamFilter() {
   state.teamFilter = null;
+  scrollToTop();
   render();
 }
 
@@ -1726,6 +1927,7 @@ function renderSearchResults() {
       const selected = state.allTeams.find(t => t.id === teamId && t.leagueKey === leagueKey);
       if (selected) {
         state.teamFilter = selected;
+        scrollToTop();
         render();
         closeSearchModal();
       }
@@ -1963,6 +2165,7 @@ async function pollTrackedProps() {
   }));
 
   propPollInFlight = false;
+  evaluatePropNotifications();
   renderPropsList();
   updatePropsBadge();
   if (!state.showStandings && !state.loading) render();
@@ -2347,6 +2550,8 @@ function initListeners() {
       document.querySelectorAll('.date-tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       state.dateOffset = parseInt(tab.dataset.offset, 10);
+      saveUI();
+      scrollToTop();
       fetchAllLeagues();
     });
   });
@@ -2357,12 +2562,33 @@ function initListeners() {
       document.querySelectorAll('.sport-pill').forEach(p => p.classList.remove('active'));
       pill.classList.add('active');
       state.leagueFilter = pill.dataset.league;
+      saveUI();
+      scrollToTop();
       if (state.showStandings) {
         fetchStandingsData();
       } else {
         render();
       }
     });
+  });
+
+  // Always-on-top (pin) toggle
+  document.getElementById('pin-toggle')?.addEventListener('click', () => {
+    const btn = document.getElementById('pin-toggle');
+    state.alwaysOnTop = !state.alwaysOnTop;
+    btn?.classList.toggle('active', state.alwaysOnTop);
+    nativeInvoke('set_always_on_top', { value: state.alwaysOnTop });
+    saveUI();
+  });
+
+  // Compact (frameless) mode toggle
+  document.getElementById('compact-toggle')?.addEventListener('click', () => {
+    const btn = document.getElementById('compact-toggle');
+    state.compact = !state.compact;
+    btn?.classList.toggle('active', state.compact);
+    document.body.classList.toggle('compact', state.compact);
+    nativeInvoke('set_compact', { value: state.compact });
+    saveUI();
   });
 
   // Global click delegate (game cards, standings, teams, external links)
@@ -2444,6 +2670,7 @@ function initListeners() {
   document.getElementById('standings-toggle')?.addEventListener('click', () => {
     const btn = document.getElementById('standings-toggle');
     state.showStandings = !state.showStandings;
+    scrollToTop();
     if (state.showStandings) {
       btn?.classList.add('active');
       document.querySelector('.date-tabs')?.setAttribute('style', 'display: none;');
@@ -2487,27 +2714,85 @@ function initListeners() {
   }
 }
 
-// ── Auto-refresh ──────────────────────────────────────────
+// ── Apply persisted UI on launch ──────────────────────────
 
-function startAutoRefresh() {
-  clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => {
+function applyPersistedUI() {
+  // Reflect saved date tab + league filter in the controls.
+  document.querySelectorAll('.date-tab').forEach(t => {
+    t.classList.toggle('active', parseInt(t.dataset.offset, 10) === state.dateOffset);
+  });
+  document.querySelectorAll('.sport-pill').forEach(p => {
+    p.classList.toggle('active', p.dataset.league === state.leagueFilter);
+  });
+
+  // Restore window states (always-on-top, compact/frameless).
+  const pinBtn = document.getElementById('pin-toggle');
+  pinBtn?.classList.toggle('active', state.alwaysOnTop);
+  if (state.alwaysOnTop) nativeInvoke('set_always_on_top', { value: true });
+
+  const compactBtn = document.getElementById('compact-toggle');
+  compactBtn?.classList.toggle('active', state.compact);
+  if (state.compact) {
+    document.body.classList.add('compact');
+    nativeInvoke('set_compact', { value: true });
+  }
+}
+
+// ── Auto-refresh (dynamic backoff) ────────────────────────
+// Poll fast while something is live, slow when only scheduled games remain,
+// and very slow when nothing is on — to spare ESPN and the battery.
+
+function anyLiveGame() {
+  for (const l of LEAGUES) {
+    for (const g of (state.games[l.key] || [])) {
+      if (g.statusType === 'STATUS_IN_PROGRESS') return true;
+    }
+  }
+  return false;
+}
+
+function anyGamesToday() {
+  for (const l of LEAGUES) {
+    if ((state.games[l.key] || []).length > 0) return true;
+  }
+  return false;
+}
+
+function trackedPropLive() {
+  for (const p of state.trackedProps) {
+    const d = state.propDetailsCache[p.gameId];
+    if (d && getStatusFromDetail(d).name === 'STATUS_IN_PROGRESS') return true;
+  }
+  return false;
+}
+
+function nextRefreshDelay() {
+  if (anyLiveGame() || trackedPropLive()) return 30_000;
+  if (anyGamesToday() || state.trackedProps.length > 0) return 120_000;
+  return 300_000;
+}
+
+function scheduleAutoRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(async () => {
     if (state.dateOffset === 0) {
       if (state.showStandings) {
-        fetchStandingsData();
+        await fetchStandingsData();
       } else {
-        fetchAllLeagues();
+        await fetchAllLeagues({ background: true });
       }
     }
     // Tracked props update independently of the visible date.
-    pollTrackedProps();
-  }, 30_000);
+    await pollTrackedProps();
+    scheduleAutoRefresh();
+  }, nextRefreshDelay());
 }
 
 // ── Init ──────────────────────────────────────────────────
 
 initListeners();
+applyPersistedUI();
 fetchAllLeagues();
-startAutoRefresh();
+scheduleAutoRefresh();
 updatePropsBadge();
 pollTrackedProps();

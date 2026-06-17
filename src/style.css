@@ -1407,7 +1407,9 @@ body {
 }
 
 /* ── Search Toggle Button ───────────────────────────────── */
-.search-toggle {
+.search-toggle,
+.pin-toggle,
+.compact-toggle {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1422,16 +1424,22 @@ body {
   flex-shrink: 0;
 }
 
-.search-toggle:hover {
+.search-toggle:hover,
+.pin-toggle:hover,
+.compact-toggle:hover {
   background: var(--green-dark);
   color: var(--text-accent);
 }
 
-.search-toggle:active {
+.search-toggle:active,
+.pin-toggle:active,
+.compact-toggle:active {
   transform: scale(0.9);
 }
 
-.search-toggle.active {
+.search-toggle.active,
+.pin-toggle.active,
+.compact-toggle.active {
   background: var(--bg-pill-active);
   color: #fff;
 }

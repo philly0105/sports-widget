@@ -1,19 +1,18 @@
 use tauri::Manager;
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
-fn open_url(url: String) {
-  #[cfg(target_os = "windows")]
-  let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn();
-  #[cfg(target_os = "macos")]
-  let _ = std::process::Command::new("open").arg(&url).spawn();
-  #[cfg(target_os = "linux")]
-  let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+  app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn fetch_teams_native(sport: String, league: String) -> Result<String, String> {
+fn fetch_teams_native(sport: String, league: String) -> Result<String, String> {
   let url = format!("https://site.api.espn.com/apis/site/v2/sports/{}/{}/teams?limit=1000", sport, league);
-  
+
   #[cfg(target_os = "windows")]
   let cmd_name = "curl.exe";
   #[cfg(not(target_os = "windows"))]
@@ -35,10 +34,67 @@ async fn fetch_teams_native(sport: String, league: String) -> Result<String, Str
   }
 }
 
+#[tauri::command]
+fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+  app
+    .notification()
+    .builder()
+    .title(title)
+    .body(body)
+    .show()
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, value: bool) -> Result<(), String> {
+  if let Some(w) = app.get_webview_window("main") {
+    w.set_always_on_top(value).map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+// Compact mode = no window decorations (frameless). The header has a
+// data-tauri-drag-region so the window stays movable while frameless.
+#[tauri::command]
+fn set_compact(app: tauri::AppHandle, value: bool) -> Result<(), String> {
+  if let Some(w) = app.get_webview_window("main") {
+    w.set_decorations(!value).map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+#[tauri::command]
+fn set_tray_tooltip(app: tauri::AppHandle, text: String) -> Result<(), String> {
+  if let Some(tray) = app.tray_by_id("main") {
+    tray.set_tooltip(Some(&text)).map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+fn toggle_main_window(app: &tauri::AppHandle) {
+  if let Some(w) = app.get_webview_window("main") {
+    if w.is_visible().unwrap_or(false) {
+      let _ = w.hide();
+    } else {
+      let _ = w.show();
+      let _ = w.set_focus();
+    }
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
-    .invoke_handler(tauri::generate_handler![open_url, fetch_teams_native])
+    .plugin(tauri_plugin_opener::init())
+    .plugin(tauri_plugin_notification::init())
+    .invoke_handler(tauri::generate_handler![
+      open_url,
+      fetch_teams_native,
+      notify,
+      set_always_on_top,
+      set_compact,
+      set_tray_tooltip
+    ])
     .setup(|app| {
       println!("Tauri setup starting...");
 
@@ -49,6 +105,43 @@ pub fn run() {
             .build(),
         )?;
       }
+
+      // ── System tray ──────────────────────────────────────
+      let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
+      let hide = MenuItemBuilder::with_id("hide", "Hide").build(app)?;
+      let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+      let menu = MenuBuilder::new(app).items(&[&show, &hide, &quit]).build()?;
+
+      let _tray = TrayIconBuilder::with_id("main")
+        .icon(app.default_window_icon().unwrap().clone())
+        .tooltip("Sports Widget")
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+          "show" => {
+            if let Some(w) = app.get_webview_window("main") {
+              let _ = w.show();
+              let _ = w.set_focus();
+            }
+          }
+          "hide" => {
+            if let Some(w) = app.get_webview_window("main") {
+              let _ = w.hide();
+            }
+          }
+          "quit" => app.exit(0),
+          _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+          if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+          } = event
+          {
+            toggle_main_window(tray.app_handle());
+          }
+        })
+        .build(app)?;
 
       // Explicitly get the window and make sure it's visible and focused
       if let Some(window) = app.get_webview_window("main") {
