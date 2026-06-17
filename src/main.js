@@ -35,10 +35,16 @@ let state = {
   teamFilter: null,
   searchQuery: '',
   myTeamsCollapsed: null,
+  trackedProps: JSON.parse(localStorage.getItem('sports-widget-props') || '[]'),
+  propDetailsCache: {},   // gameId -> ESPN summary JSON (live stat source)
 };
 
 function saveFavorites() {
   localStorage.setItem('sports-widget-favorites', JSON.stringify(state.favorites));
+}
+
+function saveTrackedProps() {
+  localStorage.setItem('sports-widget-props', JSON.stringify(state.trackedProps));
 }
 
 function toggleFavorite(abbr) {
@@ -509,6 +515,9 @@ function render() {
   let html = '';
   let totalGames = 0;
 
+  // ── My Props section (live tracker) ──
+  html += renderInlinePropsSection();
+
   // ── My Teams section ──
   if (state.favorites.length > 0 && !state.teamFilter) {
     const favGames = [];
@@ -610,7 +619,7 @@ function render() {
 
   if (totalGames === 0) {
     const label = state.dateOffset === -1 ? 'yesterday' : state.dateOffset === 1 ? 'upcoming' : 'today';
-    html = `
+    html = renderInlinePropsSection() + `
       <div class="empty-state">
         <div class="empty-icon">📭</div>
         <h3>No games ${label}</h3>
@@ -1746,6 +1755,589 @@ function renderSearchResults() {
   });
 }
 
+// ══════════════════════════════════════════════════════════
+// PLAYER PROP TRACKER
+// ══════════════════════════════════════════════════════════
+
+// Stat menus per ESPN sport. statLabel = the box-score column header to read.
+// group = box-score statistic group name (lowercased) when a sport reuses the
+// same column across groups (e.g. NFL "YDS" for passing/rushing/receiving).
+// parse = 'firstOfDash' for columns like "2-5" where we want the made count.
+const STAT_MENUS = {
+  basketball: [
+    { key: 'pts', label: 'Points', statLabel: 'PTS' },
+    { key: 'reb', label: 'Rebounds', statLabel: 'REB' },
+    { key: 'ast', label: 'Assists', statLabel: 'AST' },
+    { key: '3pm', label: '3-Pointers Made', statLabel: '3PT', parse: 'firstOfDash' },
+    { key: 'stl', label: 'Steals', statLabel: 'STL' },
+    { key: 'blk', label: 'Blocks', statLabel: 'BLK' },
+    { key: 'to',  label: 'Turnovers', statLabel: 'TO' },
+  ],
+  football: [
+    { key: 'pass_yds', label: 'Passing Yards', group: 'passing', statLabel: 'YDS' },
+    { key: 'pass_td',  label: 'Passing TDs', group: 'passing', statLabel: 'TD' },
+    { key: 'rush_yds', label: 'Rushing Yards', group: 'rushing', statLabel: 'YDS' },
+    { key: 'rush_td',  label: 'Rushing TDs', group: 'rushing', statLabel: 'TD' },
+    { key: 'rec',      label: 'Receptions', group: 'receiving', statLabel: 'REC' },
+    { key: 'rec_yds',  label: 'Receiving Yards', group: 'receiving', statLabel: 'YDS' },
+    { key: 'rec_td',   label: 'Receiving TDs', group: 'receiving', statLabel: 'TD' },
+  ],
+  baseball: [
+    { key: 'h',       label: 'Hits', group: 'batting', statLabel: 'H' },
+    { key: 'hr',      label: 'Home Runs', group: 'batting', statLabel: 'HR' },
+    { key: 'rbi',     label: 'RBIs', group: 'batting', statLabel: 'RBI' },
+    { key: 'r',       label: 'Runs', group: 'batting', statLabel: 'R' },
+    { key: 'bb',      label: 'Walks', group: 'batting', statLabel: 'BB' },
+    { key: 'so_bat',  label: 'Strikeouts (Batter)', group: 'batting', statLabel: 'K' },
+    { key: 'k_pitch', label: 'Strikeouts (Pitcher)', group: 'pitching', statLabel: 'K' },
+  ],
+  hockey: [
+    { key: 'g',   label: 'Goals', statLabel: 'G' },
+    { key: 'a',   label: 'Assists', statLabel: 'A' },
+    { key: 'pts', label: 'Points', statLabel: 'P' },
+    { key: 'sog', label: 'Shots on Goal', statLabel: 'SOG' },
+  ],
+  soccer: [
+    { key: 'g',   label: 'Goals', statLabel: 'G' },
+    { key: 'a',   label: 'Assists', statLabel: 'A' },
+    { key: 'sog', label: 'Shots on Goal', statLabel: 'SOG' },
+    { key: 'sh',  label: 'Shots', statLabel: 'SH' },
+  ],
+};
+
+// Transient state for the "add prop" wizard.
+let propBuilder = null;
+function newBuilder() {
+  return {
+    step: 'game',   // game → team → player → stat → line
+    game: null, team: null,
+    roster: [], rosterLoading: false, rosterError: null, rosterQuery: '',
+    athlete: null, stat: null, line: '', direction: 'over',
+  };
+}
+
+let propPollInFlight = false;
+
+function addTrackedProp(prop) {
+  state.trackedProps.push(prop);
+  saveTrackedProps();
+  updatePropsBadge();
+  pollTrackedProps();
+}
+
+function removeTrackedProp(id) {
+  state.trackedProps = state.trackedProps.filter(p => p.id !== id);
+  saveTrackedProps();
+  updatePropsBadge();
+  renderPropsList();
+  if (!state.showStandings) render();
+}
+
+// ── Stat value extraction from a live/final box score ─────
+
+function parseStatNumber(raw, mode) {
+  if (raw === undefined || raw === null) return null;
+  let s = String(raw).trim();
+  if (s === '' || s === '--' || s === '-') return null;
+  if (mode === 'firstOfDash' && s.includes('-')) s = s.split('-')[0];
+  const n = parseFloat(s.replace(/,/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+// Returns the player's current value for the prop's stat, or null if it
+// hasn't been recorded yet (game not started / player hasn't appeared).
+function getPropCurrentValue(detail, prop) {
+  const teams = detail?.boxscore?.players || [];
+  for (const teamData of teams) {
+    for (const g of (teamData.statistics || [])) {
+      if (prop.group && (g.name || '').toLowerCase() !== prop.group) continue;
+      const labels = g.labels || [];
+      const idx = labels.indexOf(prop.statLabel);
+      if (idx === -1) continue;
+      const ath = (g.athletes || []).find(a => String(a.athlete?.id) === String(prop.athleteId));
+      if (!ath) continue;
+      if (ath.didNotPlay) return 0;
+      const v = parseStatNumber(ath.stats?.[idx], prop.parse);
+      if (v !== null) return v;
+    }
+  }
+  return null;
+}
+
+function getStatusFromDetail(detail) {
+  const st = detail?.header?.competitions?.[0]?.status?.type;
+  return {
+    name: st?.name || 'STATUS_SCHEDULED',
+    detail: st?.shortDetail || st?.detail || '',
+  };
+}
+
+// Evaluate a prop against the cached game detail.
+function evalProp(prop) {
+  const detail = state.propDetailsCache[prop.gameId];
+  const status = detail ? getStatusFromDetail(detail) : { name: 'STATUS_SCHEDULED', detail: '' };
+  const live = status.name === 'STATUS_IN_PROGRESS';
+  const final = status.name === 'STATUS_FINAL';
+  const current = detail ? getPropCurrentValue(detail, prop) : null;
+  const isOver = prop.direction === 'over';
+
+  let hit = null; // null = undecided
+  if (current !== null) {
+    if (final) hit = isOver ? current > prop.line : current < prop.line;
+    else if (isOver && current > prop.line) hit = true;       // over clinched live
+    else if (!isOver && current >= prop.line) hit = false;    // under busted live
+  }
+
+  // Chip text
+  let chip, chipClass;
+  if (!detail || status.name === 'STATUS_SCHEDULED') {
+    chip = status.detail || 'Scheduled'; chipClass = 'pending';
+  } else if (current === null) {
+    chip = live ? 'Live · no stat yet' : 'No stat'; chipClass = 'pending';
+  } else if (final) {
+    chip = hit ? '✅ HIT' : '❌ MISS'; chipClass = hit ? 'hit' : 'miss';
+  } else if (hit === true) {
+    chip = isOver ? '✅ Over hit' : '✅ HIT'; chipClass = 'hit';
+  } else if (hit === false) {
+    chip = '❌ Busted'; chipClass = 'miss';
+  } else {
+    const remaining = (prop.line - current);
+    chip = isOver
+      ? `${remaining.toFixed(1)} to go`
+      : `${remaining.toFixed(1)} cushion`;
+    chipClass = 'live';
+  }
+
+  const denom = prop.line > 0 ? prop.line : 1;
+  const pct = current === null ? 0 : Math.max(0, Math.min(100, (current / denom) * 100));
+
+  return { current, live, final, status, hit, chip, chipClass, pct };
+}
+
+// ── Roster fetch (pre-game player picking) ────────────────
+
+async function fetchRoster(sport, league, teamId) {
+  const url = `${BASE_URL}/${sport}/${league}/teams/${teamId}/roster`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Roster: ${res.status}`);
+  const data = await res.json();
+  const out = [];
+  const push = (a) => {
+    if (!a || !(a.id || a.uid)) return;
+    out.push({
+      id: a.id || a.uid,
+      name: a.displayName || a.fullName || a.shortName || '',
+      pos: a.position?.abbreviation || a.position?.name || '',
+      headshot: a.headshot?.href || (typeof a.headshot === 'string' ? a.headshot : ''),
+      jersey: a.jersey || '',
+    });
+  };
+  const groups = data.athletes || [];
+  if (Array.isArray(groups) && groups.length && groups[0] && groups[0].items) {
+    groups.forEach(grp => (grp.items || []).forEach(push));
+  } else if (Array.isArray(groups)) {
+    groups.forEach(push);
+  }
+  return out;
+}
+
+// ── Polling tracked games ─────────────────────────────────
+
+async function pollTrackedProps() {
+  if (state.trackedProps.length === 0 || propPollInFlight) return;
+  propPollInFlight = true;
+
+  // One fetch per unique game.
+  const byGame = new Map();
+  for (const p of state.trackedProps) {
+    if (!byGame.has(p.gameId)) byGame.set(p.gameId, p);
+  }
+
+  await Promise.allSettled([...byGame.values()].map(async (p) => {
+    try {
+      const url = `${BASE_URL}/${p.sport}/${p.leagueSlug}/summary?event=${p.gameId}`;
+      const res = await fetch(url);
+      if (!res.ok) return;
+      state.propDetailsCache[p.gameId] = await res.json();
+    } catch (_) { /* keep last good cache */ }
+  }));
+
+  propPollInFlight = false;
+  renderPropsList();
+  updatePropsBadge();
+  if (!state.showStandings && !state.loading) render();
+}
+
+// ── Header badge ──────────────────────────────────────────
+
+function updatePropsBadge() {
+  const badge = document.getElementById('props-count-badge');
+  if (!badge) return;
+  const n = state.trackedProps.length;
+  badge.textContent = n;
+  badge.style.display = n > 0 ? 'flex' : 'none';
+}
+
+// ── Prop card (shared by modal list + inline section) ─────
+
+function renderPropCardHTML(prop) {
+  const r = evalProp(prop);
+  const dirLabel = `${prop.direction === 'over' ? 'O' : 'U'} ${prop.line} ${prop.statName}`;
+  const valueText = r.current === null ? '—' : (Number.isInteger(r.current) ? r.current : r.current.toFixed(1));
+  const barColor = r.chipClass === 'hit' ? 'var(--green-bright)'
+    : r.chipClass === 'miss' ? 'var(--text-live)'
+    : 'var(--text-accent)';
+
+  return `
+    <div class="prop-card">
+      <div class="prop-card-main">
+        <div class="prop-headshot-wrap">
+          ${prop.headshot
+            ? `<img class="prop-headshot" src="${escapeHtml(prop.headshot)}" alt="" loading="lazy" />`
+            : `<div class="prop-headshot prop-headshot-ph">👤</div>`}
+        </div>
+        <div class="prop-info">
+          <div class="prop-name-row">
+            <span class="prop-name">${escapeHtml(prop.athleteName)}</span>
+            <span class="prop-meta">${escapeHtml(prop.teamAbbr)}${prop.athletePos ? ' · ' + escapeHtml(prop.athletePos) : ''}</span>
+          </div>
+          <span class="prop-line">${escapeHtml(dirLabel)} <span class="prop-matchup">· ${escapeHtml(prop.matchup)}</span></span>
+        </div>
+        <div class="prop-value-col">
+          <span class="prop-value">${valueText}</span>
+          <span class="prop-chip ${r.chipClass}">${escapeHtml(r.chip)}</span>
+        </div>
+        <button class="prop-remove-btn" data-prop-id="${prop.id}" title="Remove">✕</button>
+      </div>
+      <div class="prop-bar-track">
+        <div class="prop-bar-fill" style="width: ${r.pct}%; background: ${barColor};"></div>
+        <div class="prop-bar-line"></div>
+      </div>
+    </div>`;
+}
+
+// Compact tracker shown at the top of the scoreboard.
+function renderInlinePropsSection() {
+  if (state.trackedProps.length === 0 || state.teamFilter) return '';
+  return `
+    <section class="league-section props-inline-section">
+      <div class="league-header">
+        <span class="league-icon">🎯</span>
+        <h2>MY PROPS</h2>
+        <span class="game-count">${state.trackedProps.length}</span>
+      </div>
+      ${state.trackedProps.map(renderPropCardHTML).join('')}
+    </section>`;
+}
+
+// ── Props modal (list + add wizard) ───────────────────────
+
+function openPropsModal() {
+  let modal = document.getElementById('props-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'props-modal';
+    document.getElementById('app').appendChild(modal);
+  }
+  propBuilder = null;
+
+  modal.innerHTML = `
+    <div class="modal-overlay" id="props-modal-overlay">
+      <div class="modal-sheet" id="props-modal-sheet" style="max-height: 85vh; display: flex; flex-direction: column;">
+        <div class="modal-header-bg" style="padding: 16px 20px; border-bottom: 1px solid var(--border-card); display: flex; align-items: center; justify-content: space-between; background: var(--bg-header); position: relative; border-radius: var(--radius-lg) var(--radius-lg) 0 0;">
+          <h2 id="props-modal-title" style="margin: 0; font-size: 20px; font-weight: 800; color: #fff;">🎯 Prop Tracker</h2>
+          <button class="modal-close" id="props-modal-close-btn" style="position: static;">✕</button>
+        </div>
+        <div class="modal-body" id="props-modal-body" style="padding: 16px; flex: 1; overflow-y: auto;"></div>
+      </div>
+    </div>`;
+
+  modal.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  document.getElementById('props-toggle')?.classList.add('active');
+
+  document.getElementById('props-modal-close-btn').addEventListener('click', closePropsModal);
+  document.getElementById('props-modal-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'props-modal-overlay') closePropsModal();
+  });
+
+  renderPropsModalBody();
+  pollTrackedProps();
+}
+
+function closePropsModal() {
+  const modal = document.getElementById('props-modal');
+  if (!modal) return;
+  modal.classList.remove('open');
+  document.getElementById('props-toggle')?.classList.remove('active');
+  if (!document.getElementById('game-detail-modal')?.classList.contains('open') &&
+      !document.getElementById('team-detail-modal')?.classList.contains('open')) {
+    document.body.style.overflow = '';
+  }
+  setTimeout(() => { modal.innerHTML = ''; propBuilder = null; }, 300);
+}
+
+// Re-render only the list (used by polling) without disturbing the wizard.
+function renderPropsList() {
+  const body = document.getElementById('props-modal-body');
+  if (!body || propBuilder) return;
+  renderPropsModalBody();
+}
+
+function renderPropsModalBody() {
+  const body = document.getElementById('props-modal-body');
+  const title = document.getElementById('props-modal-title');
+  if (!body) return;
+
+  if (propBuilder) {
+    title.textContent = 'Add a Prop';
+    renderBuilder(body);
+    return;
+  }
+
+  title.textContent = '🎯 Prop Tracker';
+  let html = `
+    <button class="prop-add-btn" id="prop-add-btn">+ Track a player prop</button>`;
+
+  if (state.trackedProps.length === 0) {
+    html += `
+      <div class="search-empty-state" style="padding: 32px 16px;">
+        <div style="font-size: 28px; margin-bottom: 8px;">🎯</div>
+        <h3>No props tracked yet</h3>
+        <p style="color: var(--text-muted); font-size: 13px;">Pick a game, a player, a stat, and a line — then watch it live.</p>
+      </div>`;
+  } else {
+    html += `<div class="props-list">${state.trackedProps.map(renderPropCardHTML).join('')}</div>`;
+  }
+
+  body.innerHTML = html;
+  document.getElementById('prop-add-btn').addEventListener('click', () => {
+    propBuilder = newBuilder();
+    renderPropsModalBody();
+  });
+  body.querySelectorAll('.prop-remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => removeTrackedProp(btn.dataset.propId));
+  });
+}
+
+// ── The add-prop wizard ───────────────────────────────────
+
+function builderBack() {
+  const order = ['game', 'team', 'player', 'stat', 'line'];
+  const i = order.indexOf(propBuilder.step);
+  if (i <= 0) { propBuilder = null; }
+  else { propBuilder.step = order[i - 1]; }
+  renderPropsModalBody();
+}
+
+function gatherSelectableGames() {
+  const games = [];
+  for (const l of LEAGUES) {
+    for (const g of (state.games[l.key] || [])) games.push(g);
+  }
+  // Live & upcoming first, then by date.
+  return games.sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+function renderBuilder(body) {
+  const b = propBuilder;
+  let html = `
+    <div class="builder-bar">
+      <button class="builder-back" id="builder-back">‹ Back</button>
+      <div class="builder-crumbs">
+        ${b.game ? `<span>${escapeHtml(b.game.away?.abbr)}@${escapeHtml(b.game.home?.abbr)}</span>` : ''}
+        ${b.athlete ? `<span>· ${escapeHtml(b.athlete.name)}</span>` : ''}
+        ${b.stat ? `<span>· ${escapeHtml(b.stat.label)}</span>` : ''}
+      </div>
+    </div>`;
+
+  if (b.step === 'game') {
+    const games = gatherSelectableGames();
+    html += `<div class="builder-prompt">Choose a game</div>`;
+    if (games.length === 0) {
+      html += `<div class="search-empty-state" style="padding:24px;"><p style="color:var(--text-muted);font-size:13px;">No games loaded. Close this and pick a date (Today / Upcoming) on the scoreboard first.</p></div>`;
+    } else {
+      html += `<div class="builder-list">`;
+      for (const g of games) {
+        const isLive = g.statusType === 'STATUS_IN_PROGRESS';
+        const meta = isLive ? `<span class="prop-chip live">LIVE</span>` : escapeHtml(g.statusDetail || formatTime(g.date));
+        html += `
+          <button class="builder-row" data-game-id="${g.id}">
+            <span class="builder-row-icon">${g.leagueIcon}</span>
+            <span class="builder-row-main">${escapeHtml(g.away?.abbr)} @ ${escapeHtml(g.home?.abbr)}</span>
+            <span class="builder-row-meta">${meta}</span>
+          </button>`;
+      }
+      html += `</div>`;
+    }
+  }
+
+  else if (b.step === 'team') {
+    html += `<div class="builder-prompt">Which team's player?</div><div class="builder-list">`;
+    for (const side of ['away', 'home']) {
+      const t = b.game[side];
+      if (!t) continue;
+      html += `
+        <button class="builder-row" data-side="${side}">
+          <img class="builder-row-logo" src="${escapeHtml(t.logo || '')}" alt="" />
+          <span class="builder-row-main">${escapeHtml(t.name || t.abbr)}</span>
+          <span class="builder-row-meta">${escapeHtml(t.record || '')}</span>
+        </button>`;
+    }
+    html += `</div>`;
+  }
+
+  else if (b.step === 'player') {
+    html += `<div class="builder-prompt">Choose a player — ${escapeHtml(b.team?.name || b.team?.abbr || '')}</div>`;
+    if (b.rosterLoading) {
+      html += `<div class="loading-state" style="padding:32px;"><div class="spinner"></div><p>Loading roster…</p></div>`;
+    } else if (b.rosterError) {
+      html += `<div class="search-empty-state" style="padding:24px;"><div style="font-size:22px;">⚠️</div><h3>Couldn't load roster</h3><p style="color:var(--text-muted);font-size:13px;">${escapeHtml(b.rosterError)}</p></div>`;
+    } else {
+      const q = b.rosterQuery.toLowerCase();
+      const list = q ? b.roster.filter(a => a.name.toLowerCase().includes(q)) : b.roster;
+      html += `<input type="text" id="roster-search" class="builder-search" placeholder="Search players…" value="${escapeHtml(b.rosterQuery)}" />`;
+      html += `<div class="builder-list">`;
+      for (const a of list) {
+        html += `
+          <button class="builder-row" data-athlete-id="${a.id}">
+            <div class="prop-headshot-wrap" style="width:34px;height:34px;">
+              ${a.headshot ? `<img class="prop-headshot" src="${escapeHtml(a.headshot)}" alt="" loading="lazy" />` : `<div class="prop-headshot prop-headshot-ph" style="font-size:14px;">👤</div>`}
+            </div>
+            <span class="builder-row-main">${escapeHtml(a.name)}</span>
+            <span class="builder-row-meta">${escapeHtml(a.pos)}${a.jersey ? ' · #' + escapeHtml(a.jersey) : ''}</span>
+          </button>`;
+      }
+      if (list.length === 0) html += `<p style="color:var(--text-muted);font-size:13px;padding:16px;text-align:center;">No players match.</p>`;
+      html += `</div>`;
+    }
+  }
+
+  else if (b.step === 'stat') {
+    const menu = STAT_MENUS[b.game.sport] || [];
+    html += `<div class="builder-prompt">Which stat for ${escapeHtml(b.athlete?.name || '')}?</div><div class="builder-list">`;
+    for (const s of menu) {
+      html += `<button class="builder-row" data-stat-key="${s.key}"><span class="builder-row-main">${escapeHtml(s.label)}</span><span class="builder-row-meta">${escapeHtml(s.statLabel)}</span></button>`;
+    }
+    html += `</div>`;
+  }
+
+  else if (b.step === 'line') {
+    html += `
+      <div class="builder-prompt">Set the line</div>
+      <div class="line-builder">
+        <div class="line-summary">
+          <strong>${escapeHtml(b.athlete?.name || '')}</strong> — ${escapeHtml(b.stat?.label || '')}
+        </div>
+        <div class="line-dir-toggle">
+          <button class="line-dir ${b.direction === 'over' ? 'active' : ''}" data-dir="over">Over</button>
+          <button class="line-dir ${b.direction === 'under' ? 'active' : ''}" data-dir="under">Under</button>
+        </div>
+        <input type="number" step="0.5" inputmode="decimal" id="line-input" class="builder-search" placeholder="e.g. 24.5" value="${escapeHtml(b.line)}" style="text-align:center;font-size:18px;font-weight:700;" />
+        <button class="prop-add-btn" id="line-confirm" ${b.line === '' ? 'disabled' : ''}>Track this prop</button>
+      </div>`;
+  }
+
+  body.innerHTML = html;
+  bindBuilderEvents(body);
+}
+
+function bindBuilderEvents(body) {
+  const b = propBuilder;
+  document.getElementById('builder-back')?.addEventListener('click', builderBack);
+
+  if (b.step === 'game') {
+    body.querySelectorAll('.builder-row[data-game-id]').forEach(row => {
+      row.addEventListener('click', () => {
+        b.game = gatherSelectableGames().find(g => g.id === row.dataset.gameId);
+        b.step = 'team';
+        renderPropsModalBody();
+      });
+    });
+  }
+
+  else if (b.step === 'team') {
+    body.querySelectorAll('.builder-row[data-side]').forEach(row => {
+      row.addEventListener('click', async () => {
+        const side = row.dataset.side;
+        const t = b.game[side];
+        b.team = { id: t.id, abbr: t.abbr, name: t.name, logo: t.logo };
+        b.step = 'player';
+        b.roster = []; b.rosterError = null; b.rosterLoading = true; b.rosterQuery = '';
+        renderPropsModalBody();
+        try {
+          b.roster = await fetchRoster(b.game.sport, b.game.leagueSlug, t.id);
+          b.rosterLoading = false;
+          if (b.roster.length === 0) b.rosterError = 'No roster returned for this team.';
+        } catch (err) {
+          b.rosterLoading = false; b.rosterError = err.message;
+        }
+        if (propBuilder && propBuilder.step === 'player') renderPropsModalBody();
+      });
+    });
+  }
+
+  else if (b.step === 'player') {
+    const search = document.getElementById('roster-search');
+    if (search) {
+      search.addEventListener('input', (e) => {
+        b.rosterQuery = e.target.value;
+        renderPropsModalBody();
+        const el = document.getElementById('roster-search');
+        if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+      });
+    }
+    body.querySelectorAll('.builder-row[data-athlete-id]').forEach(row => {
+      row.addEventListener('click', () => {
+        b.athlete = b.roster.find(a => String(a.id) === row.dataset.athleteId);
+        b.step = 'stat';
+        renderPropsModalBody();
+      });
+    });
+  }
+
+  else if (b.step === 'stat') {
+    body.querySelectorAll('.builder-row[data-stat-key]').forEach(row => {
+      row.addEventListener('click', () => {
+        const menu = STAT_MENUS[b.game.sport] || [];
+        b.stat = menu.find(s => s.key === row.dataset.statKey);
+        b.step = 'line';
+        renderPropsModalBody();
+      });
+    });
+  }
+
+  else if (b.step === 'line') {
+    body.querySelectorAll('.line-dir').forEach(btn => {
+      btn.addEventListener('click', () => { b.direction = btn.dataset.dir; renderPropsModalBody(); });
+    });
+    const input = document.getElementById('line-input');
+    input?.addEventListener('input', (e) => {
+      b.line = e.target.value;
+      const confirm = document.getElementById('line-confirm');
+      if (confirm) confirm.disabled = e.target.value === '';
+    });
+    document.getElementById('line-confirm')?.addEventListener('click', () => {
+      const lineNum = parseFloat(b.line);
+      if (isNaN(lineNum)) return;
+      const g = b.game, a = b.athlete, s = b.stat;
+      addTrackedProp({
+        id: 'p_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+        gameId: g.id, sport: g.sport, leagueSlug: g.leagueSlug, league: g.league,
+        matchup: `${g.away?.abbr} @ ${g.home?.abbr}`,
+        athleteId: a.id, athleteName: a.name, athletePos: a.pos, headshot: a.headshot,
+        teamAbbr: b.team.abbr,
+        statKey: s.key, statName: s.label, statLabel: s.statLabel,
+        group: s.group || null, parse: s.parse || null,
+        line: lineNum, direction: b.direction,
+        createdAt: Date.now(),
+      });
+      propBuilder = null;
+      renderPropsModalBody();
+    });
+  }
+}
+
 // ── Event Listeners ───────────────────────────────────────
 
 function initListeners() {
@@ -1798,6 +2390,13 @@ function initListeners() {
       }
       return;
     }
+    // Remove a tracked prop from the inline section
+    const propRemove = e.target.closest('.prop-remove-btn');
+    if (propRemove) {
+      e.stopPropagation();
+      removeTrackedProp(propRemove.dataset.propId);
+      return;
+    }
     // Favorite star toggle
     const star = e.target.closest('.fav-star');
     if (star) {
@@ -1828,6 +2427,16 @@ function initListeners() {
       closeSearchModal();
     } else {
       openSearchModal();
+    }
+  });
+
+  // Prop tracker toggle
+  document.getElementById('props-toggle')?.addEventListener('click', () => {
+    const btn = document.getElementById('props-toggle');
+    if (btn?.classList.contains('active')) {
+      closePropsModal();
+    } else {
+      openPropsModal();
     }
   });
 
@@ -1862,6 +2471,7 @@ function initListeners() {
       closeModal();
       closeTeamModal();
       closeSearchModal();
+      closePropsModal();
     }
   });
 
@@ -1889,6 +2499,8 @@ function startAutoRefresh() {
         fetchAllLeagues();
       }
     }
+    // Tracked props update independently of the visible date.
+    pollTrackedProps();
   }, 30_000);
 }
 
@@ -1897,3 +2509,5 @@ function startAutoRefresh() {
 initListeners();
 fetchAllLeagues();
 startAutoRefresh();
+updatePropsBadge();
+pollTrackedProps();
